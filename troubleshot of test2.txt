@@ -1,0 +1,140 @@
+1. Camera Not Opening/Black Screen
+Symptoms: Camera feed doesn't appear, or shows black screen
+
+Solutions
+# In run_capture() method, modify camera initialization:
+cap = None
+for camera_index in [0, 1, 2, 3]:  # Try more indexes
+    for api in [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_V4L2, cv2.CAP_ANY]:
+        cap = cv2.VideoCapture(camera_index, api)
+        if cap.isOpened():
+            self.logger.info(f"Camera opened with index {camera_index} using API {api}")
+            break
+    if cap and cap.isOpened():
+        break
+
+# Add backup test frame
+if not cap.isOpened():
+    self.logger.warning("Using test pattern - no camera found")
+    test_frame = np.zeros((480, 640, 3), np.uint8)
+    cv2.putText(test_frame, "NO CAMERA", (50, 240), 
+                cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,255), 3)
+    self.frame_queue.put(test_frame)
+
+2. MediaPipe Not Detecting Hands
+Symptoms: Hand landmarks not appearing despite visible hands
+
+Solutions
+# In __init__(), modify hand detection parameters:
+self.hands = self.mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.5,  # Lowered from 0.7
+    min_tracking_confidence=0.3,    # Lowered from 0.5
+    model_complexity=1              # Try different values (0,1)
+)
+
+# Add diagnostic overlay
+def draw_detection_info(frame, results):
+    if not results.multi_hand_landmarks:
+        cv2.putText(frame, "NO HANDS DETECTED", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+    return frame
+
+3. GUI Freezing/Lagging
+Symptoms: Interface becomes unresponsive or choppy
+
+Solutions
+# In process_frames(), add frame skipping:
+if self.frame_queue.qsize() > 2:  # Skip frames if queue is building up
+    try:
+        self.frame_queue.get_nowait()  # Discard old frame
+    except queue.Empty:
+        pass
+
+# In run(), modify main loop timing:
+while self.running:
+    start_time = time.perf_counter()
+    
+    # Process messages with timeout
+    dpg.render_dearpygui_frame(timeout=0.01)
+    
+    # Enforce minimum frame time (15ms ≈ 66fps)
+    elapsed = time.perf_counter() - start_time
+    if elapsed < 0.015:
+        time.sleep(0.015 - elapsed)
+
+4. Gesture Detection Too Sensitive/Inaccurate
+Symptoms: False positives or missed gestures
+
+Solutions
+# Enhanced gesture detection with temporal filtering
+def _detect_gesture(self, landmarks):
+    # Add movement threshold
+    movement_threshold = 0.01 * self.hand_size
+    
+    if self.prev_landmarks:
+        dx = abs(landmarks['p8'][0] - self.prev_landmarks['p8'][0])
+        dy = abs(landmarks['p8'][1] - self.prev_landmarks['p8'][1])
+        if dx < movement_threshold and dy < movement_threshold:
+            return Gesture.NONE  # Ignore micro-movements
+    
+    # Add gesture cooldown
+    if time.time() - self.last_action_time < 0.2:
+        return Gesture.NONE
+    
+    # Rest of detection logic...
+
+5. PyAutoGUI Permission Issues (macOS)
+Symptoms: Mouse control not working on macOS
+
+Solutions
+# Add platform-specific handling
+import platform
+
+if platform.system() == 'Darwin':  # macOS
+    import Quartz
+    def move_mouse(x, y):
+        event = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventMouseMoved,
+            (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+    
+    def macos_click():
+        # Similar implementation for clicks
+        pass
+
+6. Memory Leaks
+Symptoms: Increasing memory usage over time
+
+Solutions
+# Pre-allocate all buffers
+def __init__(self):
+    self.texture_data = np.zeros((self.cam_height, self.cam_width, 3), dtype=np.float32)
+    self.processing_frame = np.zeros((self.cam_height, self.cam_width, 3), dtype=np.uint8)
+    self.display_frame = np.zeros((self.cam_height, self.cam_width, 3), dtype=np.uint8)
+
+# In process_frames():
+rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB, dst=self.processing_frame)
+# Reuse arrays instead of creating new ones
+
+8. Installation Verification Script
+Add this at the beginning to check dependencies
+
+def check_dependencies():
+    try:
+        import cv2
+        assert cv2.__version__ >= '4.5'
+        import mediapipe
+        assert mediapipe.__version__ >= '0.8'
+        import pyautogui
+        import dearpygui
+    except Exception as e:
+        print(f"Missing or outdated dependency: {e}")
+        print("Please install with:")
+        print("pip install opencv-python mediapipe pyautogui dearpygui")
+        exit(1)
+
+if __name__ == "__main__":
+    check_dependencies()
+    # Rest of main code...
