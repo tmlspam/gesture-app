@@ -166,10 +166,13 @@ class GestureController:
                 dpg.render_dearpygui_frame()
                 if dpg.is_key_down(dpg.mvKey_Escape):
                     self.running = False
+        except Exception as e:
+            print(f"Error in capture thread: {e}")
         finally:
             cap.release()
             self.hands.close()
-            dpg.destroy_context()
+            if dpg.is_dearpygui_running():
+                dpg.destroy_context()
     
     def process_frame(self, frame):
         rgb_frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
@@ -317,10 +320,10 @@ class GestureController:
                     pyautogui.press('volumedown')
                     self.last_action_time = current_time
                 elif self.current_gesture == Gesture.SWIPE_UP:
-                    pyautogui.press('volumeup')  # Alternative mapping
+                    pyautogui.press('volumeup')
                     self.last_action_time = current_time
                 elif self.current_gesture == Gesture.SWIPE_DOWN:
-                    pyautogui.press('volumedown')  # Alternative mapping
+                    pyautogui.press('volumedown')
                     self.last_action_time = current_time
         
         except Exception as e:
