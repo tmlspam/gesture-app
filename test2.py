@@ -10,6 +10,8 @@ from collections import deque
 import queue
 import json
 import os
+import logging
+from threading import Lock
 
 class Gesture(Enum):
     NONE = auto()
@@ -25,14 +27,28 @@ class Gesture(Enum):
 
 class GestureController:
     def __init__(self):
+        # Initialize logging
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s - %(threadName)s - %(message)s',
+            filename='gesture_control.log'
+        )
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Initializing GestureController")
+        
+        # Thread synchronization
+        self.lock = Lock()
+        self.running = True
+        
         # Initialize mediapipe
         self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
+            max_num_hands=2,
+            min_detection_confidence=0.6,
             min_tracking_confidence=0.5,
-            model_complexity=1
+            model_complexity=0
         )
         
         # Screen and camera properties
@@ -56,32 +72,34 @@ class GestureController:
         self.last_gesture_time = time.time()
         self.last_action_time = time.time()
         self.control_mode = "mouse"
-        self.running = True
         self.calibrating = False
-        self.hand_size = 0.1  # Default hand size
+        self.hand_size = 0.1
         self.gesture_confidence = {gesture: 0 for gesture in Gesture}
+        self.last_mouse_pos = None
         
-        # Thread-safe queue for frame processing
+        # Thread-safe queues
         self.frame_queue = queue.Queue(maxsize=2)
         self.landmarks_queue = queue.Queue(maxsize=1)
         
         # Initialize GUI
         self.setup_gui()
         
-        # Load configuration if exists
+        # Load configuration
         self.load_config()
         
         # Start threads
-        self.capture_thread = threading.Thread(target=self.run_capture, daemon=True)
-        self.processing_thread = threading.Thread(target=self.process_frames, daemon=True)
+        self.capture_thread = threading.Thread(target=self.run_capture, daemon=True, name="CaptureThread")
+        self.processing_thread = threading.Thread(target=self.process_frames, daemon=True, name="ProcessingThread")
         self.capture_thread.start()
         self.processing_thread.start()
+        
+        # Disable PyAutoGUI failsafe
+        pyautogui.FAILSAFE = False
     
     def setup_gui(self):
         dpg.create_context()
         dpg.create_viewport(title='Gesture Control Pro', width=800, height=600)
         
-        # Create texture for camera feed
         with dpg.texture_registry(show=False):
             self.texture_data = np.zeros((self.cam_height, self.cam_width, 3), dtype=np.float32)
             self.raw_texture = dpg.add_raw_texture(
@@ -144,17 +162,19 @@ class GestureController:
         dpg.set_primary_window("main_window", True)
     
     def update_config(self, sender=None, data=None):
-        self.config['sensitivity'] = dpg.get_value(self.sensitivity_slider)
-        self.config['smoothing'] = dpg.get_value(self.smoothing_slider)
-        self.config['gesture_threshold'] = dpg.get_value(self.gesture_threshold_slider)
+        with self.lock:
+            self.config['sensitivity'] = dpg.get_value(self.sensitivity_slider)
+            self.config['smoothing'] = dpg.get_value(self.smoothing_slider)
+            self.config['gesture_threshold'] = dpg.get_value(self.gesture_threshold_slider)
     
     def save_config(self):
         try:
             with open('gesture_config.json', 'w') as f:
                 json.dump(self.config, f)
             dpg.set_value(self.calibration_text, "Configuration saved successfully")
+            self.logger.info("Configuration saved")
         except Exception as e:
-            print(f"Error saving config: {e}")
+            self.logger.error(f"Error saving config: {e}")
             dpg.set_value(self.calibration_text, f"Error saving config: {str(e)}")
     
     def load_config(self):
@@ -162,47 +182,57 @@ class GestureController:
             if os.path.exists('gesture_config.json'):
                 with open('gesture_config.json', 'r') as f:
                     loaded_config = json.load(f)
-                    self.config.update(loaded_config)
+                    with self.lock:
+                        self.config.update(loaded_config)
                     # Update GUI sliders
                     if dpg.does_item_exist(self.sensitivity_slider):
                         dpg.set_value(self.sensitivity_slider, self.config['sensitivity'])
                         dpg.set_value(self.smoothing_slider, self.config['smoothing'])
                         dpg.set_value(self.gesture_threshold_slider, self.config['gesture_threshold'])
+                self.logger.info("Configuration loaded")
         except Exception as e:
-            print(f"Error loading config: {e}")
+            self.logger.error(f"Error loading config: {e}")
     
     def start_calibration(self):
-        self.calibrating = True
-        self.calibration_step = 0
-        self.calibration_values = []
+        with self.lock:
+            self.calibrating = True
+            self.calibration_step = 0
+            self.calibration_values = []
         dpg.set_value(self.calibration_text, "Calibration: Show your open hand to the camera")
+        self.logger.info("Starting calibration")
     
     def complete_calibration(self, hand_size):
-        self.hand_size = hand_size
-        self.calibrating = False
+        with self.lock:
+            self.hand_size = hand_size
+            self.calibrating = False
         dpg.set_value(self.calibration_text, f"Calibration complete. Hand size: {hand_size:.2f}")
+        self.logger.info(f"Calibration complete. Hand size: {hand_size:.2f}")
     
     def set_control_mode(self, mode):
-        self.control_mode = mode
+        with self.lock:
+            self.control_mode = mode
         dpg.set_value(self.status_text, f"{mode.capitalize()} Mode")
         self._update_gesture_visualization()
+        self.logger.info(f"Control mode changed to {mode}")
     
     def run_capture(self):
-        # Try multiple camera indexes
-        for camera_index in [0, 1, 2]:
-            cap = cv2.VideoCapture(camera_index)
-            if cap.isOpened():
-                dpg.set_value(self.camera_status, f"Camera: Using index {camera_index}")
-                break
-            else:
-                dpg.set_value(self.camera_status, f"Camera: Trying index {camera_index}...")
-        
-        if not cap or not cap.isOpened():
-            dpg.set_value(self.camera_status, "Error: No camera found")
-            self.running = False
-            return
-        
+        self.logger.info("Starting capture thread")
+        cap = None
         try:
+            for camera_index in [0, 1, 2]:
+                self.logger.info(f"Trying camera index {camera_index}")
+                cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    self.logger.info(f"Camera opened at index {camera_index}")
+                    dpg.set_value(self.camera_status, f"Camera: Using index {camera_index}")
+                    break
+            
+            if not cap or not cap.isOpened():
+                self.logger.error("No camera could be opened")
+                dpg.set_value(self.camera_status, "Error: No camera found")
+                self.running = False
+                return
+            
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cam_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cam_height)
             cap.set(cv2.CAP_PROP_FPS, 30)
@@ -213,6 +243,7 @@ class GestureController:
             while self.running and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
+                    self.logger.warning("Failed to capture frame")
                     continue
                 
                 # Put frame in queue if not full
@@ -229,23 +260,26 @@ class GestureController:
                     dpg.set_value(self.fps_text, f"FPS: {int(fps)}")
                     prev_time = curr_time
                 
-                # Check for exit condition
-                if dpg.is_key_down(dpg.mvKey_Escape):
-                    self.running = False
-                
                 time.sleep(0.01)  # Prevent CPU overload
                 
         except Exception as e:
-            print(f"Error in capture thread: {e}")
+            self.logger.error(f"Error in capture thread: {e}")
             dpg.set_value(self.camera_status, f"Camera Error: {str(e)}")
         finally:
-            cap.release()
-            self.hands.close()
+            if cap and cap.isOpened():
+                cap.release()
+            self.logger.info("Capture thread stopped")
     
     def process_frames(self):
+        self.logger.info("Starting processing thread")
         while self.running:
             try:
                 frame = self.frame_queue.get(timeout=0.1)
+                
+                # Skip frames if queue is building up
+                if self.frame_queue.qsize() > 1:
+                    continue
+                
                 rgb_frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
                 results = self.hands.process(rgb_frame)
                 
@@ -253,20 +287,27 @@ class GestureController:
                     hand_landmarks = results.multi_hand_landmarks[0]
                     landmarks = {f"p{i}": (lm.x, lm.y) for i, lm in enumerate(hand_landmarks.landmark)}
                     
+                    # Draw landmarks for visualization
+                    self.mp_drawing.draw_landmarks(
+                        rgb_frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                    
                     # Put landmarks in queue for main thread
                     try:
                         self.landmarks_queue.put_nowait((rgb_frame, landmarks))
                     except queue.Full:
                         pass
                 
-                # Update camera feed even if no hands detected
-                np.copyto(self.texture_data, cv2.resize(rgb_frame, (self.cam_width, self.cam_height)).astype(np.float32) / 255.0)
+                # Update camera feed
+                resized_frame = cv2.resize(rgb_frame, (self.cam_width, self.cam_height)).astype(np.float32) / 255.0
+                np.copyto(self.texture_data, resized_frame)
                 dpg.set_value("camera_texture", self.texture_data)
                 
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Error in processing thread: {e}")
+                self.logger.error(f"Error in processing thread: {e}")
+        
+        self.logger.info("Processing thread stopped")
     
     def _handle_calibration(self, landmarks):
         if self.calibration_step == 0:
@@ -280,89 +321,93 @@ class GestureController:
                 self.complete_calibration(avg_size)
     
     def _detect_gesture(self, landmarks):
-        thumb_tip = landmarks['p4']
-        index_tip = landmarks['p8']
-        middle_tip = landmarks['p12']
-        ring_tip = landmarks['p16']
-        wrist = landmarks['p0']
-        
-        # Dynamic threshold based on hand size
-        pinch_threshold = 0.03 + (self.hand_size * self.config['pinch_threshold_multiplier'])
-        
-        # Calculate distances
-        thumb_index_dist = np.linalg.norm(np.array(thumb_tip) - np.array(index_tip))
-        thumb_middle_dist = np.linalg.norm(np.array(thumb_tip) - np.array(middle_tip))
-        
-        # Check pinch gestures first (high priority)
-        if thumb_index_dist < pinch_threshold:
-            self.gesture_confidence[Gesture.PINCH] += 1
-            if self.gesture_confidence[Gesture.PINCH] > self.config['min_gesture_confidence']:
-                return Gesture.PINCH
-        else:
-            self.gesture_confidence[Gesture.PINCH] = 0
-        
-        # Check two-finger pinch (thumb + middle)
-        if thumb_middle_dist < pinch_threshold:
-            self.gesture_confidence[Gesture.TWO_FINGER_PINCH] += 1
-            if self.gesture_confidence[Gesture.TWO_FINGER_PINCH] > self.config['min_gesture_confidence']:
-                return Gesture.TWO_FINGER_PINCH
-        else:
-            self.gesture_confidence[Gesture.TWO_FINGER_PINCH] = 0
-        
-        # Check pointing gesture
-        index_extended = (index_tip[1] < landmarks['p6'][1]) and \
-                        (index_tip[1] < landmarks['p10'][1]) and \
-                        (index_tip[1] < landmarks['p14'][1])
-        
-        if index_extended:
-            middle_closed = middle_tip[1] > landmarks['p10'][1]
-            ring_closed = landmarks['p16'][1] > landmarks['p13'][1]
-            pinky_closed = landmarks['p20'][1] > landmarks['p17'][1]
+        try:
+            thumb_tip = landmarks['p4']
+            index_tip = landmarks['p8']
+            middle_tip = landmarks['p12']
+            wrist = landmarks['p0']
             
-            if middle_closed and ring_closed and pinky_closed:
-                self.gesture_confidence[Gesture.POINTING] += 1
-                if self.gesture_confidence[Gesture.POINTING] > self.config['min_gesture_confidence']:
-                    return Gesture.POINTING
-        else:
-            self.gesture_confidence[Gesture.POINTING] = 0
-        
-        # Check swipe gestures
-        if self.prev_landmarks:
-            dt = time.time() - self.last_gesture_time
-            if dt > 0:
-                dx = landmarks['p8'][0] - self.prev_landmarks['p8'][0]
-                dy = landmarks['p8'][1] - self.prev_landmarks['p8'][1]
-                velocity_x = abs(dx) / dt
-                velocity_y = abs(dy) / dt
+            # Dynamic threshold based on hand size
+            pinch_threshold = 0.03 + (self.hand_size * self.config['pinch_threshold_multiplier'])
+            
+            # Calculate distances
+            thumb_index_dist = np.linalg.norm(np.array(thumb_tip) - np.array(index_tip))
+            thumb_middle_dist = np.linalg.norm(np.array(thumb_tip) - np.array(middle_tip))
+            
+            # Check pinch gestures first (high priority)
+            if thumb_index_dist < pinch_threshold:
+                self.gesture_confidence[Gesture.PINCH] += 1
+                if self.gesture_confidence[Gesture.PINCH] > self.config['min_gesture_confidence']:
+                    return Gesture.PINCH
+            else:
+                self.gesture_confidence[Gesture.PINCH] = 0
+            
+            # Check two-finger pinch (thumb + middle)
+            if thumb_middle_dist < pinch_threshold:
+                self.gesture_confidence[Gesture.TWO_FINGER_PINCH] += 1
+                if self.gesture_confidence[Gesture.TWO_FINGER_PINCH] > self.config['min_gesture_confidence']:
+                    return Gesture.TWO_FINGER_PINCH
+            else:
+                self.gesture_confidence[Gesture.TWO_FINGER_PINCH] = 0
+            
+            # Check pointing gesture
+            index_extended = (index_tip[1] < landmarks['p6'][1]) and \
+                            (index_tip[1] < landmarks['p10'][1]) and \
+                            (index_tip[1] < landmarks['p14'][1])
+            
+            if index_extended:
+                middle_closed = middle_tip[1] > landmarks['p10'][1]
+                ring_closed = landmarks['p16'][1] > landmarks['p13'][1]
+                pinky_closed = landmarks['p20'][1] > landmarks['p17'][1]
                 
-                if velocity_x > self.config['swipe_velocity_threshold'] and abs(dx) > self.config['gesture_threshold']:
-                    return Gesture.SWIPE_LEFT if dx < 0 else Gesture.SWIPE_RIGHT
-                if velocity_y > self.config['swipe_velocity_threshold'] and abs(dy) > self.config['gesture_threshold']:
-                    return Gesture.SWIPE_UP if dy < 0 else Gesture.SWIPE_DOWN
+                if middle_closed and ring_closed and pinky_closed:
+                    self.gesture_confidence[Gesture.POINTING] += 1
+                    if self.gesture_confidence[Gesture.POINTING] > self.config['min_gesture_confidence']:
+                        return Gesture.POINTING
+            else:
+                self.gesture_confidence[Gesture.POINTING] = 0
+            
+            # Check swipe gestures
+            if self.prev_landmarks:
+                dt = time.time() - self.last_gesture_time
+                if dt > 0:
+                    dx = landmarks['p8'][0] - self.prev_landmarks['p8'][0]
+                    dy = landmarks['p8'][1] - self.prev_landmarks['p8'][1]
+                    velocity_x = abs(dx) / dt
+                    velocity_y = abs(dy) / dt
+                    
+                    if velocity_x > self.config['swipe_velocity_threshold'] and abs(dx) > self.config['gesture_threshold']:
+                        return Gesture.SWIPE_LEFT if dx < 0 else Gesture.SWIPE_RIGHT
+                    if velocity_y > self.config['swipe_velocity_threshold'] and abs(dy) > self.config['gesture_threshold']:
+                        return Gesture.SWIPE_UP if dy < 0 else Gesture.SWIPE_DOWN
+            
+            # Check thumb gestures
+            thumb_up = (thumb_tip[1] < landmarks['p3'][1]) and \
+                      (thumb_tip[1] < landmarks['p2'][1])
+            thumb_down = (thumb_tip[1] > landmarks['p3'][1]) and \
+                        (thumb_tip[1] > landmarks['p2'][1])
+            
+            if thumb_up:
+                self.gesture_confidence[Gesture.THUMB_UP] += 1
+                if self.gesture_confidence[Gesture.THUMB_UP] > self.config['min_gesture_confidence']:
+                    return Gesture.THUMB_UP
+            else:
+                self.gesture_confidence[Gesture.THUMB_UP] = 0
+            
+            if thumb_down:
+                self.gesture_confidence[Gesture.THUMB_DOWN] += 1
+                if self.gesture_confidence[Gesture.THUMB_DOWN] > self.config['min_gesture_confidence']:
+                    return Gesture.THUMB_DOWN
+            else:
+                self.gesture_confidence[Gesture.THUMB_DOWN] = 0
+            
+            self.prev_landmarks = landmarks
+            self.last_gesture_time = time.time()
+            return Gesture.NONE
         
-        # Check thumb gestures
-        thumb_up = (thumb_tip[1] < landmarks['p3'][1]) and \
-                  (thumb_tip[1] < landmarks['p2'][1])
-        thumb_down = (thumb_tip[1] > landmarks['p3'][1]) and \
-                    (thumb_tip[1] > landmarks['p2'][1])
-        
-        if thumb_up:
-            self.gesture_confidence[Gesture.THUMB_UP] += 1
-            if self.gesture_confidence[Gesture.THUMB_UP] > self.config['min_gesture_confidence']:
-                return Gesture.THUMB_UP
-        else:
-            self.gesture_confidence[Gesture.THUMB_UP] = 0
-        
-        if thumb_down:
-            self.gesture_confidence[Gesture.THUMB_DOWN] += 1
-            if self.gesture_confidence[Gesture.THUMB_DOWN] > self.config['min_gesture_confidence']:
-                return Gesture.THUMB_DOWN
-        else:
-            self.gesture_confidence[Gesture.THUMB_DOWN] = 0
-        
-        self.prev_landmarks = landmarks
-        self.last_gesture_time = time.time()
-        return Gesture.NONE
+        except Exception as e:
+            self.logger.error(f"Error in gesture detection: {e}")
+            return Gesture.NONE
     
     def _execute_control(self, landmarks):
         current_time = time.time()
@@ -378,7 +423,7 @@ class GestureController:
                     ]
                     
                     # Apply smoothing
-                    if hasattr(self, 'last_mouse_pos'):
+                    if self.last_mouse_pos:
                         smoothed_pos = [
                             self.config['smoothing'] * new_pos[0] + (1 - self.config['smoothing']) * self.last_mouse_pos[0],
                             self.config['smoothing'] * new_pos[1] + (1 - self.config['smoothing']) * self.last_mouse_pos[1]
@@ -396,44 +441,55 @@ class GestureController:
                 elif self.current_gesture == Gesture.PINCH:
                     pyautogui.click()
                     self.last_action_time = current_time
+                    self.logger.debug("Mouse click executed")
                 
                 elif self.current_gesture == Gesture.TWO_FINGER_PINCH:
                     pyautogui.rightClick()
                     self.last_action_time = current_time
+                    self.logger.debug("Right click executed")
             
             elif self.control_mode == "media":
                 if self.current_gesture == Gesture.SWIPE_LEFT:
                     pyautogui.press('prevtrack')
                     self.last_action_time = current_time
+                    self.logger.debug("Previous track command")
                 elif self.current_gesture == Gesture.SWIPE_RIGHT:
                     pyautogui.press('nexttrack')
                     self.last_action_time = current_time
+                    self.logger.debug("Next track command")
                 elif self.current_gesture == Gesture.PINCH:
                     pyautogui.press('playpause')
                     self.last_action_time = current_time
+                    self.logger.debug("Play/pause command")
                 elif self.current_gesture == Gesture.THUMB_UP:
                     pyautogui.press('volumeup')
                     self.last_action_time = current_time
+                    self.logger.debug("Volume up command")
                 elif self.current_gesture == Gesture.THUMB_DOWN:
                     pyautogui.press('volumedown')
                     self.last_action_time = current_time
+                    self.logger.debug("Volume down command")
             
             elif self.control_mode == "keyboard":
                 if self.current_gesture == Gesture.THUMB_UP:
-                    pyautogui.hotkey('ctrl', 'shift', 'right')  # Example: Next tab
+                    pyautogui.hotkey('ctrl', 'shift', 'right')
                     self.last_action_time = current_time
+                    self.logger.debug("Next tab command")
                 elif self.current_gesture == Gesture.THUMB_DOWN:
-                    pyautogui.hotkey('ctrl', 'shift', 'left')  # Example: Previous tab
+                    pyautogui.hotkey('ctrl', 'shift', 'left')
                     self.last_action_time = current_time
+                    self.logger.debug("Previous tab command")
                 elif self.current_gesture == Gesture.SWIPE_UP:
                     pyautogui.press('volumeup')
                     self.last_action_time = current_time
+                    self.logger.debug("Volume up command")
                 elif self.current_gesture == Gesture.SWIPE_DOWN:
                     pyautogui.press('volumedown')
                     self.last_action_time = current_time
+                    self.logger.debug("Volume down command")
         
         except Exception as e:
-            print(f"Error executing control: {e}")
+            self.logger.error(f"Error executing control: {e}")
     
     def _update_gesture_visualization(self):
         gesture_desc = {
@@ -460,41 +516,58 @@ class GestureController:
         dpg.set_value(self.gesture_text, f"Gesture: {self.current_gesture.name}")
 
     def run(self):
-        # Main thread handles landmarks and GUI updates
-        while self.running and dpg.is_dearpygui_running():
-            try:
+        self.logger.info("Starting main application loop")
+        try:
+            while self.running and dpg.is_dearpygui_running():
                 # Process landmarks if available
-                rgb_frame, landmarks = self.landmarks_queue.get_nowait()
-                if self.calibrating:
-                    self._handle_calibration(landmarks)
-                else:
-                    self.current_gesture = self._detect_gesture(landmarks)
-                    self._execute_control(landmarks)
-                    self._update_gesture_visualization()
+                try:
+                    rgb_frame, landmarks = self.landmarks_queue.get_nowait()
+                    if self.calibrating:
+                        self._handle_calibration(landmarks)
+                    else:
+                        with self.lock:
+                            self.current_gesture = self._detect_gesture(landmarks)
+                            self._execute_control(landmarks)
+                        self._update_gesture_visualization()
+                except queue.Empty:
+                    pass
                 
-                # Draw landmarks on frame
-                if hasattr(self, 'mp_drawing'):
-                    mp.solutions.drawing_utils.draw_landmarks(
-                        rgb_frame, landmarks, self.mp_hands.HAND_CONNECTIONS)
+                # Handle GUI events
+                dpg.render_dearpygui_frame()
                 
-                # Update texture
-                np.copyto(self.texture_data, cv2.resize(rgb_frame, (self.cam_width, self.cam_height)).astype(np.float32) / 255.0)
-                dpg.set_value("camera_texture", self.texture_data)
+                # Check for exit condition
+                if dpg.is_key_down(dpg.mvKey_Escape):
+                    self.running = False
                 
-            except queue.Empty:
-                pass
+                time.sleep(0.01)  # Prevent CPU overload
             
-            dpg.render_dearpygui_frame()
-            time.sleep(0.01)  # Prevent CPU overload
-        
-        # Cleanup
+        except Exception as e:
+            self.logger.error(f"Main loop error: {e}", exc_info=True)
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        self.logger.info("Cleaning up resources")
         self.running = False
+        
+        # Wait for threads to finish
         if self.capture_thread.is_alive():
             self.capture_thread.join()
         if self.processing_thread.is_alive():
             self.processing_thread.join()
-        dpg.destroy_context()
+        
+        # Close MediaPipe resources
+        self.hands.close()
+        
+        # Cleanup Dear PyGui
+        if dpg.is_dearpygui_running():
+            dpg.destroy_context()
+        
+        self.logger.info("Application shutdown complete")
 
 if __name__ == "__main__":
-    controller = GestureController()
-    controller.run()
+    try:
+        controller = GestureController()
+        controller.run()
+    except Exception as e:
+        logging.error(f"Application crash: {str(e)}", exc_info=True)
